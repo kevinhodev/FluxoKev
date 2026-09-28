@@ -1,0 +1,76 @@
+# Produção na VM.Standard.E2.1.Micro da Oracle: 1 GB de RAM e 1/8 de OCPU.
+# As diferenças para o compose.yaml de desenvolvimento são todas consequência
+# desse orçamento apertado e da exposição à internet.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: fluxo-postgres
+    environment:
+      POSTGRES_DB: fluxo_ia
+      POSTGRES_USER: fluxo_ia
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}
+    # Os padrões do Postgres assumem uma máquina bem maior. Sem isso ele reserva
+    # memória que a instância não tem e o kernel acaba matando algum processo.
+    command: >
+      postgres
+      -c shared_buffers=64MB
+      -c effective_cache_size=256MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=32MB
+      -c max_connections=20
+      -c max_worker_processes=2
+      -c max_parallel_workers=1
+      -c max_parallel_workers_per_gather=0
+    volumes:
+      - fluxo_ia_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fluxo_ia -d fluxo_ia"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: fluxo-api
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATABASE_URL: postgresql://fluxo_ia:${POSTGRES_PASSWORD}@postgres:5432/fluxo_ia
+      # Teto de heap do V8. Sem ele o Node dimensiona pela RAM total da máquina
+      # e só descobre que não cabe quando o kernel derruba o processo.
+      NODE_OPTIONS: --max-old-space-size=160
+    # Sem publicar porta: quem fala com a internet é o Caddy. A API só é
+    # alcançável pela rede interna do compose.
+    expose:
+      - "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: fluxo-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Domínio do certificado, vindo do .env. A porta 80 precisa continuar
+      # aberta mesmo depois: é por ela que o Let's Encrypt revalida.
+      FLUXO_DOMAIN: ${FLUXO_DOMAIN:?Defina FLUXO_DOMAIN no arquivo .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  fluxo_ia_postgres:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,18 @@
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+coverage/
+test/failures/
+
+# Backend
+backend/node_modules/
+backend/dist/
+backend/.env
+backend/coverage/
+android/.gradle/
+ios/Pods/
+*.iml
+.idea/
+.vscode/

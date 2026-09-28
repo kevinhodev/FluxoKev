@@ -1,0 +1,37 @@
+# O Caddy emite e renova o certificado Let's Encrypt sozinho, o que satisfaz a
+# exigência de HTTPS que o app faz em release (lib/core/config/api_config.dart).
+{$FLUXO_DOMAIN} {
+	encode gzip
+
+	# Cabeçalhos de segurança. O app é nativo e não usa nada disso, mas a API
+	# fica exposta publicamente e um navegador pode alcançá-la.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# O corpo do import de PDF vai em base64 dentro do JSON, o que infla o
+	# tamanho em cerca de 33%. O padrão do Caddy não limita, mas um teto
+	# explícito evita que um upload gigante derrube uma instância de 1 GB.
+	request_body {
+		max_size 25MB
+	}
+
+	reverse_proxy api:8080 {
+		# OCR de PDF é lento nesta instância; o padrão de 2min não basta.
+		transport http {
+			response_header_timeout 5m
+			dial_timeout 10s
+		}
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10MB
+			roll_keep 3
+		}
+	}
+}
