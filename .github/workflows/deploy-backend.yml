@@ -1,0 +1,141 @@
+# Deploy do backend na VM da Oracle.
+#
+# Roda a cada push na main que mexa em backend/ e também sob demanda pela aba
+# Actions. Os testes precisam passar antes de qualquer coisa chegar à VM.
+#
+# Secrets do repositório (Settings → Secrets and variables → Actions):
+#   ORACLE_HOST         IP ou domínio da VM.
+#   ORACLE_SSH_KEY      Chave privada completa, incluindo as linhas BEGIN/END.
+#   ORACLE_KNOWN_HOSTS  Opcional, mas recomendado: saída de
+#                       `ssh-keyscan -t ed25519 <host>` rodado de um lugar
+#                       confiável. Sem ele a chave do host é aceita às cegas.
+# Variáveis opcionais (mesma tela, aba Variables):
+#   ORACLE_USER         Padrão: ubuntu.
+#   ORACLE_APP_DIR      Padrão: /home/ubuntu/fluxo.
+#
+# O .env de produção continua morando só na VM: o deploy nunca o envia nem o
+# sobrescreve, e aborta se ele não existir.
+name: Deploy backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy-backend.yml"
+  workflow_dispatch:
+
+# Dois deploys simultâneos brigariam pelo mesmo docker compose na VM.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      HOST: ${{ secrets.ORACLE_HOST }}
+      SSH_USER: ${{ vars.ORACLE_USER || 'ubuntu' }}
+      APP_DIR: ${{ vars.ORACLE_APP_DIR || '/home/ubuntu/fluxo' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar SSH
+        env:
+          SSH_KEY: ${{ secrets.ORACLE_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.ORACLE_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$HOST" ] || [ -z "$SSH_KEY" ]; then
+            echo "::error::Defina os secrets ORACLE_HOST e ORACLE_SSH_KEY."
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          if [ -n "$KNOWN_HOSTS" ]; then
+            printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::ORACLE_KNOWN_HOSTS não definido; aceitando a chave do host sem verificação."
+            ssh-keyscan -T 15 "$HOST" > ~/.ssh/known_hosts
+          fi
+          cat > ~/.ssh/config <<EOF
+          Host oracle
+            HostName $HOST
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ServerAliveInterval 30
+          EOF
+
+      # Só o que está versionado em backend/ vai para a VM: nada de .env,
+      # node_modules ou dist locais.
+      - name: Empacotar backend
+        run: git archive --format=tar.gz -o backend.tar.gz HEAD:backend
+
+      - name: Enviar pacote
+        run: ssh oracle 'cat > /tmp/fluxo-backend.tar.gz' < backend.tar.gz
+
+      - name: Atualizar e subir containers
+        run: |
+          ssh oracle "APP_DIR='$APP_DIR' sh -s" <<'REMOTE'
+          set -eu
+          cd "$APP_DIR"
+
+          if [ ! -f .env ]; then
+            echo "::error::$APP_DIR/.env não existe na VM; abortando antes de mexer em qualquer coisa."
+            exit 1
+          fi
+
+          # Extrai por cima do diretório atual em vez de trocar a pasta: o nome
+          # dela define o projeto do compose e, com ele, o volume do Postgres.
+          tar -xzf /tmp/fluxo-backend.tar.gz -C "$APP_DIR"
+          rm -f /tmp/fluxo-backend.tar.gz
+          chmod +x scripts/*.sh
+
+          # As migrations rodam sozinhas no start do container da API.
+          docker compose -f compose.prod.yaml up -d --build --remove-orphans
+
+          # O disco da VM é pequeno e cada build deixa uma imagem órfã para trás.
+          docker image prune -f >/dev/null
+
+          echo "Aguardando /health..."
+          i=0
+          until docker exec fluxo-api wget -qO- http://127.0.0.1:8080/health >/dev/null 2>&1; do
+            i=$((i + 1))
+            if [ "$i" -ge 30 ]; then
+              echo "::error::API não respondeu /health em 150s."
+              docker compose -f compose.prod.yaml ps
+              docker logs --tail 80 fluxo-api
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "API saudável."
+          docker compose -f compose.prod.yaml ps
+          REMOTE
+
+      - name: Limpar chave
+        if: always()
+        run: rm -f ~/.ssh/id_deploy
